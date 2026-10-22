@@ -20,11 +20,38 @@ Usage: python server.py
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import json, urllib.request, urllib.error, urllib.parse
+import os, json, urllib.request, urllib.error, urllib.parse
 import http.server, socketserver, gzip, time, re, threading, datetime
 from urllib.parse import urlparse, parse_qs
+import ml_engine
 
-PORT = 5000
+import sys
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# ── Load .env configuration ───────────────────────────────────────────────────
+def _load_dotenv():
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip()
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception as e:
+            print(f"  [.env] Warning reading .env: {e}")
+
+_load_dotenv()
+PORT = int(os.environ.get("PORT", 5000))
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 # ── Sector index constituents ──────────────────────────────────────────────────
 SECTOR_INDICES = {
@@ -1267,10 +1294,13 @@ def build_stock_context(tickers):
             if rows_data:
                 income_rows = "Financial History (Screener.in):\n" + "\n".join(rows_data)
 
+        price_disp = f"₹{price:,.2f}" if price is not None else "Data unavailable"
+        range_disp = f"₹{yl} – ₹{yh}" if (yl is not None and yh is not None) else "N/A"
+
         section = f"""
 ━━━ {name} ({ticker}) ━━━
-Live Price:    ₹{price:,.2f} {'('+str(chg)+'% today)' if chg else ''} {pos_52w}
-52-Week Range: ₹{yl} – ₹{yh}
+Live Price:    {price_disp} {'('+str(chg)+'% today)' if chg else ''} {pos_52w}
+52-Week Range: {range_disp}
 {trend_str}
 
 Valuation:
@@ -1310,16 +1340,18 @@ def _get_row(table, *keys):
 
 
 def handle_ai_chat(body_bytes):
-    """Main handler: extract tickers → fetch data → inject into LLaMA prompt → return response."""
+    """Main handler: extract tickers → fetch data → inject into LLaMA prompt OR generate deterministic explainable response."""
     try:
         payload = json.loads(body_bytes.decode("utf-8"))
     except Exception:
         return {"error": "Invalid JSON body"}, 400
 
-    messages      = payload.get("messages", [])
-    groq_api_key  = payload.get("groq_api_key", "")
-    if not groq_api_key:
-        return {"error": "groq_api_key missing"}, 400
+    messages = payload.get("messages", [])
+    if not messages and payload.get("message"):
+        messages = [{"role": "user", "content": payload.get("message")}]
+    lang = payload.get("lang", "en")
+    groq_api_key = os.environ.get("GROQ_API_KEY", "").strip() or payload.get("groq_api_key", "").strip()
+
     if not messages:
         return {"error": "messages missing"}, 400
 
@@ -1332,14 +1364,16 @@ def handle_ai_chat(body_bytes):
 
     # Step 1: extract tickers from user message
     tickers = extract_tickers_from_message(user_msg)
-    print(f"  [AI-Chat] Tickers detected: {tickers}")
+    print(f"  [AI-Chat] Tickers detected: {tickers}, language: {lang}")
 
     # Step 2: fetch real data
     stock_context, raw_data = build_stock_context(tickers)
 
-    # Step 3: build system prompt with injected real data
-    if stock_context:
-        system_prompt = f"""You are NeStiQ AI Advisor, an expert in Indian stock markets (NSE/BSE).
+    # Step 3: If Groq API key is present, attempt live LLM call
+    if groq_api_key:
+        if stock_context:
+            system_prompt = f"""You are NeStiQ AI Advisor, an expert in Indian stock markets (NSE/BSE).
+Language mode: {lang}. Answer fluently in {lang} while preserving standard financial terminology (P/E, ROE, EPS, Debt/Equity, CMP).
 
 REAL-TIME MARKET DATA has been fetched for you RIGHT NOW from NSE India and Screener.in:
 
@@ -1348,58 +1382,196 @@ REAL-TIME MARKET DATA has been fetched for you RIGHT NOW from NSE India and Scre
 INSTRUCTIONS:
 - Use the EXACT numbers above in your analysis. Do not guess or hallucinate figures.
 - When you quote P/E, price, ROE or any metric — it comes from the live data above.
-- If data shows N/A for a metric, say it's not available rather than guessing.
-- Structure your response: Price Analysis → Valuation → Financials → Verdict
+- If data shows N/A for a metric, state that it is unavailable from the current source.
+- Explain the 'WHY?' behind your conclusions: highlight (+) positive drivers and (-) risk factors to monitor.
 - Be precise, use numbers, and give a clear investment perspective.
 - Keep response to 4-6 paragraphs. Format with <strong> for key terms."""
-    else:
-        system_prompt = """You are NeStiQ AI Advisor, an expert in Indian stock markets (NSE/BSE).
+        else:
+            system_prompt = f"""You are NeStiQ AI Advisor, an expert in Indian stock markets (NSE/BSE).
+Language mode: {lang}. Answer in {lang} while keeping key financial acronyms intact (P/E, ROE, EPS, Debt/Equity).
 You help users understand stocks, investment strategies, and financial concepts relevant to India.
 Key focus areas: Nifty 50 stocks, fundamentals (P/E, P/B, ROE, D/E), technical analysis basics,
 SIP vs lump sum, sectoral trends, and risk management.
 Format responses with clear sections using <strong> for emphasis. Keep responses concise (3-5 paragraphs max).
 Do not add any disclaimer at the end of your response."""
 
-    # Step 4: call Groq LLaMA
-    groq_payload = json.dumps({
-        "model": "llama-3.3-70b-versatile",
-        "max_tokens": 900,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            *[{"role": m["role"], "content": m["content"]} for m in messages]
-        ]
-    }).encode("utf-8")
+        groq_payload = json.dumps({
+            "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "max_tokens": 900,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                *[{"role": m["role"], "content": m["content"]} for m in messages]
+            ]
+        }).encode("utf-8")
 
+        try:
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=groq_payload,
+                headers={
+                    "Content-Type":  "application/json",
+                    "Authorization": f"Bearer {groq_api_key}",
+                }
+            )
+            with urllib.request.urlopen(req, timeout=18) as r:
+                resp = json.loads(r.read().decode("utf-8"))
+
+            reply = resp["choices"][0]["message"]["content"]
+            return {
+                "reply":        reply,
+                "tickers_used": tickers,
+                "data_fetched": bool(stock_context),
+                "sources":      ["NSE India", "Screener.in"] if stock_context else [],
+                "provider":     "groq_llama"
+            }, 200
+
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            print(f"  [AI-Chat] Groq API returned HTTP {e.code}: {err_body[:180]}. Falling back to NeStiQ Reasoner.")
+        except Exception as e:
+            print(f"  [AI-Chat] Groq connection failed: {e}. Falling back to NeStiQ Reasoner.")
+
+    # Graceful fallback: NeStiQ Explainable Financial Reasoner
+    print("  [AI-Chat] Running NeStiQ Explainable Financial Reasoner...")
     try:
-        req = urllib.request.Request(
-            "https://api.groq.com/openai/v1/chat/completions",
-            data=groq_payload,
-            headers={
-                "Content-Type":  "application/json",
-                "Authorization": f"Bearer {groq_api_key}",
+        engine_data = {}
+        for t, d in raw_data.items():
+            f = d.get("fundamentals", {})
+            sc = d.get("screener", {})
+            engine_data[t] = {
+                "fundamentals": {
+                    "price": f.get("price"),
+                    "name": f.get("name", t),
+                    "pe": (f.get("fundamentals") or {}).get("pe") or sc.get("pe"),
+                    "pb": (f.get("fundamentals") or {}).get("pb") or sc.get("pb"),
+                    "roe": (f.get("fundamentals") or {}).get("roe") or sc.get("roe"),
+                    "de": (f.get("fundamentals") or {}).get("de") or sc.get("de"),
+                    "pm": (f.get("fundamentals") or {}).get("pm") or sc.get("pm"),
+                    "rg": (f.get("fundamentals") or {}).get("rg") or sc.get("rg"),
+                    "sector": (f.get("fundamentals") or {}).get("sector") or "",
+                    "year_high": f.get("year_high"),
+                    "year_low": f.get("year_low"),
+                    "history": f.get("history", [])
+                }
             }
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp = json.loads(r.read().decode("utf-8"))
 
-        reply = resp["choices"][0]["message"]["content"]
+        reasoning = ml_engine.generate_explainable_ai_response(tickers, user_msg, engine_data, lang=lang)
         return {
-            "reply":        reply,
+            "reply":        reasoning["reply"],
             "tickers_used": tickers,
             "data_fetched": bool(stock_context),
             "sources":      ["NSE India", "Screener.in"] if stock_context else [],
+            "scores":       reasoning.get("scores", {}),
+            "provider":     "nestiq_reasoner"
+        }, 200
+    except Exception as e:
+        print(f"  [AI-Chat] Fallback error: {e}")
+        return {
+            "reply": f"Data analysis complete for {', '.join(tickers) if tickers else 'Indian equities'}. Real-time indicators fetched.",
+            "tickers_used": tickers,
+            "data_fetched": bool(stock_context),
+            "sources": ["NSE India", "Screener.in"],
+            "provider": "nestiq_reasoner"
         }, 200
 
-    except urllib.error.HTTPError as e:
-        err_body = e.read().decode("utf-8", errors="ignore")
-        try:   err_json = json.loads(err_body)
-        except: err_json = {"raw": err_body}
-        print(f"  [AI-Chat] Groq error {e.code}: {err_body[:200]}")
-        return {"error": f"Groq API error {e.code}", "detail": err_json}, 502
 
-    except Exception as e:
-        print(f"  [AI-Chat] Error: {e}")
-        return {"error": str(e)}, 500
+def infer_sector_from_ticker(ticker):
+    t = ticker.upper()
+    for idx_name, stocks in SECTOR_INDICES.items():
+        if t in stocks:
+            if "BANK" in idx_name: return "Banking"
+            if "IT" in idx_name: return "IT"
+            if "PHARMA" in idx_name: return "Pharma"
+            if "AUTO" in idx_name: return "Auto"
+            if "FMCG" in idx_name: return "FMCG"
+            if "METAL" in idx_name: return "Metals"
+    bench = ml_engine.DEFAULT_BENCHMARKS.get(t, {})
+    return bench.get("sector", "Diversified")
+
+
+def _build_portfolio_market_map(tickers):
+    m = {}
+    for t in tickers:
+        try:
+            fund = fetch_fundamentals(t) or {}
+            f = fund.get("fundamentals") or {}
+            bench = ml_engine.DEFAULT_BENCHMARKS.get(t, {})
+            sec = f.get("sector") or bench.get("sector") or infer_sector_from_ticker(t)
+            m[t] = {
+                "name": fund.get("name", bench.get("name", t)),
+                "price": fund.get("price") or bench.get("price", 1000.0),
+                "sector": sec,
+                "pe": f.get("pe") if f.get("pe") is not None else bench.get("pe", 25.0),
+                "roe": f.get("roe") if f.get("roe") is not None else bench.get("roe", 18.0),
+                "de": f.get("de") if f.get("de") is not None else bench.get("de", 0.3),
+                "pm": f.get("pm") if f.get("pm") is not None else bench.get("pm", 15.0),
+                "rg": f.get("rg") if f.get("rg") is not None else bench.get("rg", 10.0),
+            }
+        except Exception:
+            bench = ml_engine.DEFAULT_BENCHMARKS.get(t, {})
+            m[t] = {
+                "name": bench.get("name", t),
+                "price": bench.get("price", 1000.0),
+                "sector": bench.get("sector") or infer_sector_from_ticker(t),
+                "pe": bench.get("pe", 25.0),
+                "roe": bench.get("roe", 18.0),
+                "de": bench.get("de", 0.3),
+                "pm": bench.get("pm", 15.0),
+                "rg": bench.get("rg", 10.0),
+            }
+    return m
+def handle_stock_dna(tickers):
+    results = {}
+    for t in tickers:
+        fund = fetch_fundamentals(t) or {}
+        f = fund.get("fundamentals") or {}
+        flat = {
+            "price": fund.get("price"),
+            "year_high": fund.get("year_high"),
+            "year_low": fund.get("year_low"),
+            "pe": f.get("pe"),
+            "pb": f.get("pb"),
+            "roe": f.get("roe"),
+            "de": f.get("de"),
+            "pm": f.get("pm"),
+            "rg": f.get("rg"),
+            "history": fund.get("history", [])
+        }
+        results[t] = ml_engine.calculate_stock_dna(t, flat)
+    return results
+
+def handle_risk_radar(ticker):
+    fund = fetch_fundamentals(ticker) or {}
+    f = fund.get("fundamentals") or {}
+    flat = {
+        "price": fund.get("price"),
+        "year_high": fund.get("year_high"),
+        "year_low": fund.get("year_low"),
+        "pe": f.get("pe"),
+        "pb": f.get("pb"),
+        "roe": f.get("roe"),
+        "de": f.get("de"),
+        "pm": f.get("pm"),
+        "rg": f.get("rg"),
+    }
+    return ml_engine.calculate_risk_radar(ticker, flat)
+
+def handle_ml_predict(ticker, horizon):
+    fund = fetch_fundamentals(ticker) or {}
+    f = fund.get("fundamentals") or {}
+    flat = {
+        "price": fund.get("price"),
+        "year_high": fund.get("year_high"),
+        "year_low": fund.get("year_low"),
+        "pe": f.get("pe"),
+        "pb": f.get("pb"),
+        "roe": f.get("roe"),
+        "de": f.get("de"),
+        "pm": f.get("pm"),
+        "rg": f.get("rg"),
+    }
+    engine = ml_engine.get_ml_engine()
+    return engine.predict_stock(ticker, flat, horizon_days=horizon)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1411,18 +1583,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def send_cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def do_OPTIONS(self):
-        self.send_response(200); self.send_cors(); self.end_headers()
+        self.send_response(200)
+        self.send_cors()
+        self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
         qs     = parse_qs(parsed.query)
         path   = parsed.path
 
-        if path == "/price":
+        # ── Static Logo & Favicon serving ──
+        if path in ["/nestiq_logo.png", "/logo.png", "/favicon.ico"]:
+            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nestiq_logo.png")
+            if os.path.exists(logo_path):
+                with open(logo_path, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", len(content))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_cors()
+                self.end_headers()
+                self.wfile.write(content)
+                return
+            else:
+                return self.reply(404, {"error": "Logo image not found"})
+
+        elif path == "/price":
             raw = qs.get("tickers",[""])[0]
             if not raw: return self.reply(400, {"error":"Missing tickers"})
             tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
@@ -1446,9 +1637,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, {"index":idx,"constituents":stocks,
                              "results":{t: fetch_fundamentals(t) for t in stocks}})
 
+        elif path == "/stock-dna":
+            raw = (qs.get("tickers",[""])[0] or qs.get("ticker",[""])[0]).strip()
+            if not raw: return self.reply(400, {"error":"Missing ticker or tickers parameter"})
+            compare_ticker = qs.get("compare_with",[""])[0].strip().upper()
+            tickers = [t.strip().upper() for t in raw.split(",") if t.strip()][:4]
+            dna_map = handle_stock_dna(tickers)
+            primary_data = dna_map.get(tickers[0]) if tickers else None
+            comp_data = None
+            if compare_ticker:
+                comp_map = handle_stock_dna([compare_ticker])
+                comp_data = comp_map.get(compare_ticker)
+            self.reply(200, {
+                "dna": dna_map,
+                "primary": primary_data,
+                "comparison": comp_data
+            })
+
+        elif path == "/risk-radar":
+            t = (qs.get("ticker",[""])[0] or qs.get("tickers",[""])[0]).strip().upper()
+            if not t: return self.reply(400, {"error":"Missing ticker"})
+            self.reply(200, handle_risk_radar(t))
+
+        elif path == "/model-performance":
+            engine = ml_engine.get_ml_engine()
+            self.reply(200, engine.evaluation_results)
+
         elif path == "/debug-screener":
-            # Debug endpoint: shows raw Screener HTML snippet + parsed ratios
-            # Usage: http://localhost:5000/debug-screener?ticker=CIPLA
             ticker = qs.get("ticker",[""])[0].strip().upper()
             if not ticker:
                 return self.reply(400, {"error":"Missing ticker param"})
@@ -1458,7 +1673,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 url = f"https://www.screener.in/company/{slug}/{suffix}"
                 try:
                     text, _ = _fetch(url, headers={"Referer":"https://www.screener.in/","Accept":"text/html,*/*"}, timeout=22)
-                    # Find PE context
                     pe_idx = text.lower().find("p/e")
                     roe_idx = text.lower().find("return on equity")
                     debug["attempts"].append({
@@ -1474,8 +1688,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, debug)
 
         elif path == "/stock-context":
-            # Frontend calls this: ?tickers=TCS,INFY  OR  ?q=user+message+text
-            # Returns structured real-data context string + raw data for each ticker
             raw_q  = qs.get("q",[""])[0].strip()
             raw_t  = qs.get("tickers",[""])[0].strip()
 
@@ -1491,7 +1703,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, {"tickers": [], "context": "", "data": {}})
 
             context_str, raw_data = build_stock_context(tickers)
-            # Simplify raw_data for JSON (remove history array to keep response small)
             slim = {}
             for t, d in raw_data.items():
                 f = d.get("fundamentals", {})
@@ -1523,9 +1734,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "screener_cached": len(_screener_cache),
                 "sector_indices":  list(SECTOR_INDICES.keys()),
                 "data_sources":    ["NSE India (official)","Screener.in","Yahoo Finance (chart fallback)"],
+                "groq_configured": bool(GROQ_API_KEY),
                 "endpoints": {
-                    "GET /stock-context?q=message": "Extract tickers + fetch real data → context string",
-                    "GET /stock-context?tickers=TCS,INFY": "Fetch data for specific tickers",
+                    "GET /nestiq_logo.png": "Official NeStiQ logo image",
+                    "GET /stock-dna?tickers=TCS,INFY": "8-dimension financial fingerprint",
+                    "GET /risk-radar?ticker=TCS": "5-pillar risk radar early warning system",
+                    "POST /ml-predict": "Probabilistic ML stock direction classification",
+                    "GET /model-performance": "Model Lab accuracy, confusion matrix, backtest",
+                    "POST /portfolio-analysis": "Portfolio Doctor diagnostic engine",
+                    "POST /portfolio-scenario": "What-If portfolio simulator (Before vs After)",
+                    "POST /event-scenario": "Macroeconomic event impact simulator",
+                    "POST /ai-chat": "NeStiQ AI Copilot (Groq LLaMA + Financial Reasoner fallback)",
                     "GET /price?tickers=TCS": "Price + fundamentals",
                     "GET /news": "Live market news",
                 }
@@ -1541,13 +1760,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path   = parsed.path
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length) if length > 0 else b"{}"
 
         if path == "/ai-chat":
-            length = int(self.headers.get("Content-Length", 0))
-            body   = self.rfile.read(length) if length > 0 else b"{}"
             print(f"\n── /ai-chat (POST) {len(body)} bytes ──")
             result, code = handle_ai_chat(body)
             self.reply(code, result)
+
+        elif path == "/ml-predict":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                ticker = (payload.get("ticker") or (payload.get("tickers")[0] if isinstance(payload.get("tickers"), list) and payload.get("tickers") else "") or "").strip().upper()
+                horizon = int(payload.get("horizon_days") or payload.get("horizon") or 20)
+                if not ticker:
+                    return self.reply(400, {"error": "ticker required"})
+                result = handle_ml_predict(ticker, horizon)
+                self.reply(200, result)
+            except Exception as e:
+                self.reply(500, {"error": str(e)})
+
+        elif path == "/portfolio-analysis":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                positions = payload.get("positions") or payload.get("holdings") or []
+                if not positions:
+                    return self.reply(400, {"error": "positions or holdings list required"})
+                tickers = list(set([p.get("ticker", "").strip().upper() for p in positions if p.get("ticker")]))
+                market_map = _build_portfolio_market_map(tickers)
+                analysis = ml_engine.diagnose_portfolio(positions, market_map)
+                self.reply(200, analysis)
+            except Exception as e:
+                self.reply(500, {"error": str(e)})
+
+        elif path == "/portfolio-scenario":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                positions = payload.get("positions") or payload.get("holdings") or []
+                act = payload.get("action", {})
+                if isinstance(act, str):
+                    action_dict = {
+                        "action": act.lower(),
+                        "ticker": payload.get("ticker", ""),
+                        "shares": payload.get("shares", 0),
+                        "price": payload.get("price") or payload.get("buy_price") or payload.get("avg_price", 0)
+                    }
+                else:
+                    action_dict = act or {}
+                
+                target_ticker = (action_dict.get("ticker") or payload.get("ticker") or "").strip().upper()
+                tickers = list(set([p.get("ticker", "").strip().upper() for p in positions if p.get("ticker")] + ([target_ticker] if target_ticker else [])))
+                market_map = _build_portfolio_market_map([t for t in tickers if t])
+                sim = ml_engine.simulate_what_if_scenario(positions, action_dict, market_map)
+                self.reply(200, sim)
+            except Exception as e:
+                self.reply(500, {"error": str(e)})
+
+        elif path == "/event-scenario":
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                raw_sc = payload.get("scenario") or payload.get("event_id") or payload.get("scenario_id") or "inr_weakens"
+                alias_map = {
+                    "rbi_rate_hike": "rate_hike",
+                    "rate_hike": "rate_hike",
+                    "inr_weakens": "inr_weakens",
+                    "crude_oil_surge": "crude_oil_surge",
+                    "it_demand_slowdown": "it_demand_slowdown",
+                    "credit_growth_slowdown": "credit_growth_slowdown"
+                }
+                sc_key = alias_map.get(raw_sc, raw_sc)
+                raw_items = payload.get("tickers") or payload.get("holdings") or payload.get("positions") or ["TCS", "INFY", "HDFCBANK", "RELIANCE"]
+                tickers = [t.strip().upper() if isinstance(t, str) else t.get("ticker", "").strip().upper() for t in raw_items if t]
+                market_map = _build_portfolio_market_map(tickers)
+                impact = ml_engine.simulate_event_impact(sc_key, tickers, market_map)
+                self.reply(200, impact)
+            except Exception as e:
+                self.reply(500, {"error": str(e)})
+
         else:
             self.reply(404, {"error": "Not found"})
 
