@@ -1,0 +1,26 @@
+# Environment variables & secrets
+.env
+.env.local
+*.env
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Model and training caches
+*.joblib
+*.pkl
+*.model
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
